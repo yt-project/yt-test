@@ -16,7 +16,7 @@ import numpy as np
 import random
 
 from yt.testing import \
-    assert_equal, assert_raises
+    assert_equal, assert_raises, fake_amr_ds
 from yt.frontends.stream.api import \
     load_amr_grids
 
@@ -49,7 +49,7 @@ def setup_test_ds():
 def test_grid_tree():
     """Main test suite for GridTree"""
     test_ds = setup_test_ds()
-    grid_tree = test_ds.index._get_grid_tree()
+    grid_tree = test_ds.index.grid_tree
     indices, levels, nchild, children = grid_tree.return_tree_info()
 
     grid_levels = [grid.Level for grid in test_ds.index.grids]
@@ -119,9 +119,18 @@ def test_find_points():
 
 def test_grid_arrays_view():
     ds = setup_test_ds()
-    tree = ds.index._get_grid_tree()
+    tree = ds.index.grid_tree
     grid_arr = tree.grid_arrays
     yield assert_equal, grid_arr['left_edge'], ds.index.grid_left_edge
     yield assert_equal, grid_arr['right_edge'], ds.index.grid_right_edge
     yield assert_equal, grid_arr['dims'], ds.index.grid_dimensions
     yield assert_equal, grid_arr['level'], ds.index.grid_levels[:,0]
+
+def test_grid_selector():
+    ds = fake_amr_ds()
+    tree = ds.index.grid_tree
+    sp = ds.sphere('c', 0.5)
+    gsel = tree.selector()
+    gcount = gsel.count(sp.selector)
+    scount = sp["ones"].size
+    assert_equal(gcount, scount)

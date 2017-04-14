@@ -36,6 +36,7 @@ class GridIndex(Index):
     """The index class for patch and block AMR datasets. """
     float_type = 'float64'
     _preload_implemented = False
+    _grid_tree = None
     _index_properties = ("grid_left_edge", "grid_right_edge",
                          "grid_levels", "grid_particle_count",
                          "grid_dimensions")
@@ -251,7 +252,13 @@ class GridIndex(Index):
         ind = pts.find_points_in_tree()
         return self.grids[ind], ind
 
+    @property
+    def grid_tree(self):
+        return self._get_grid_tree()
+
     def _get_grid_tree(self):
+        if self._grid_tree is not None:
+            return self._grid_tree
 
         left_edge = self.ds.arr(np.zeros((self.num_grids, 3)),
                                'code_length')
@@ -274,8 +281,10 @@ class GridIndex(Index):
             num_children[i] = np.int64(len(grid.Children))
             dimensions[i,:] = grid.ActiveDimensions
 
-        return GridTree(self.num_grids, left_edge, right_edge, dimensions,
-                        parent_ind, level, num_children)
+        self._grid_tree = GridTree(self.num_grids, left_edge,
+                                   right_edge, dimensions,
+                                   parent_ind, level, num_children)
+        return self._grid_tree
 
     def convert(self, unit):
         return self.dataset.conversion_factors[unit]
@@ -298,8 +307,8 @@ class GridIndex(Index):
             for i, g in enumerate(grids):
                 dobj._chunk_info[i] = g
         # These next two lines, when uncommented, turn "on" the fast index.
-        #if dobj._type_name != "grid":
-        #    fast_index = self._get_grid_tree()
+        if dobj._type_name != "grid":
+            fast_index = self.grid_tree.selector()
         if getattr(dobj, "size", None) is None:
             dobj.size = self._count_selection(dobj, fast_index = fast_index)
         if getattr(dobj, "shape", None) is None:
@@ -379,9 +388,18 @@ class GridIndex(Index):
             gs = gfiles[fn]
             for grids in (gs[pos:pos + size] for pos
                           in range(0, len(gs), size)):
-                dc = YTDataChunk(dobj, "io", grids,
-                        self._count_selection(dobj, grids),
-                        cache = cache, fast_index = fast_index)
+                this_loop = np.zeros(self.grids.size, "uint8")
+                for g in grids:
+                    this_loop[g.id - g._id_offset] = 1
+                fast_index2 = self.grid_tree.selector(this_loop)
+                # Now, the order of the grids array is probably not the same as
+                # the order in the fast_index, so we need to ask the fast_index
+                # to sort it.
+                chunk_size = self._count_selection(dobj, grids,
+                        fast_index = fast_index2)
+                grids = self.grids[np.asarray(fast_index2.grid_order)].tolist()
+                dc = YTDataChunk(dobj, "io", grids, chunk_size,
+                        cache = cache, fast_index = fast_index2)
                 # We allow four full chunks to be included.
                 with self.io.preload(dc, preload_fields, 
                             4.0 * size):

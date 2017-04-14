@@ -17,6 +17,7 @@ Geometry selection routines.
 import numpy as np
 cimport numpy as np
 cimport cython
+from cython.view cimport array as cvarray
 from cython cimport floating
 from libc.stdlib cimport malloc, free
 from yt.utilities.lib.fp_utils cimport fclip, iclip, fmax, fmin, imin, imax
@@ -27,7 +28,6 @@ from yt.utilities.lib.volume_container cimport \
     VolumeContainer
 from yt.utilities.lib.grid_traversal cimport \
     sampler_function, walk_volume
-from yt.utilities.lib.bitarray cimport ba_get_value, ba_set_value
 
 cdef extern from "math.h":
     double exp(double x) nogil
@@ -486,12 +486,13 @@ cdef class SelectorObject:
                 pos[0] += dds[0]
         return total
 
+    @cython.initializedcheck(False)
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.cdivision(True)
-    cdef void visit_grid_cells(self, GridVisitorData *data,
-                              grid_visitor_function *func,
-                              np.uint8_t *cached_mask = NULL):
+    cdef void visit_grid_cells(self, GridVisitor visitor,
+                              GridTreeNode *grid, int use_cache,
+                              np.uint8_t[:] cached_mask):
         # This function accepts a grid visitor function, the data that
         # corresponds to the current grid being examined (the most important
         # aspect of which is the .grid attribute, along with index values and
@@ -503,50 +504,51 @@ cdef class SelectorObject:
         cdef int dim[3]
         cdef int this_level = 0, level, i
         cdef np.float64_t pos[3]
-        level = data.grid.level
+        level = grid.level
         if level < self.min_level or level > self.max_level:
             return
         if level == self.max_level:
             this_level = 1
-        cdef np.uint8_t child_masked, selected
+        cdef np.uint8_t selected
         for i in range(3):
-            left_edge[i] = data.grid.left_edge[i]
-            right_edge[i] = data.grid.right_edge[i]
-            dds[i] = (right_edge[i] - left_edge[i])/data.grid.dims[i]
-            dim[i] = data.grid.dims[i]
+            left_edge[i] = grid.left_edge[i]
+            right_edge[i] = grid.right_edge[i]
+            dds[i] = (right_edge[i] - left_edge[i])/grid.dims[i]
+            dim[i] = grid.dims[i]
+        cdef np.uint8_t[:,:,:] child_mask
+        child_mask = cvarray(format="c",
+                             shape=(grid.dims[0], grid.dims[1], grid.dims[2]),
+                             itemsize=sizeof(np.uint8_t))
+        visitor.expand_mask(child_mask)
         with nogil:
             pos[0] = left_edge[0] + dds[0] * 0.5
-            data.pos[0] = 0
+            visitor.pos[0] = 0
             for i in range(dim[0]):
                 pos[1] = left_edge[1] + dds[1] * 0.5
-                data.pos[1] = 0
+                visitor.pos[1] = 0
                 for j in range(dim[1]):
                     pos[2] = left_edge[2] + dds[2] * 0.5
-                    data.pos[2] = 0
+                    visitor.pos[2] = 0
                     for k in range(dim[2]):
                         # We short-circuit if we have a cache; if we don't, we
                         # only set selected to true if it's *not* masked by a
                         # child and it *is* selected.
-                        if cached_mask != NULL:
-                            selected = ba_get_value(cached_mask,
-                                                    data.global_index)
+                        if use_cache == 1:
+                            selected = cached_mask[visitor.global_index]
                         else:
-                            if this_level == 1:
-                                child_masked = 0
-                            else:
-                                child_masked = check_child_masked(data)
-                            if child_masked == 0:
+                            if this_level == 1 or child_mask[i,j,k] == 1:
                                 selected = self.select_cell(pos, dds)
                             else:
                                 selected = 0
-                        func(data, selected)
-                        data.global_index += 1
+                            cached_mask[visitor.global_index] = selected
+                        visitor.visit(grid, selected)
+                        visitor.global_index += 1
                         pos[2] += dds[2]
-                        data.pos[2] += 1
+                        visitor.pos[2] += 1
                     pos[1] += dds[1]
-                    data.pos[1] += 1
+                    visitor.pos[1] += 1
                 pos[0] += dds[0]
-                data.pos[0] += 1
+                visitor.pos[0] += 1
 
     @cython.boundscheck(False)
     @cython.wraparound(False)
@@ -1464,6 +1466,22 @@ cdef class RaySelector(SelectorObject):
         if total == 0: return None
         return mask.astype("bool")
 
+    @cython.initializedcheck(False)
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    @cython.cdivision(True)
+    cdef int _get_dt(self, VolumeContainer *vc,
+                     np.float64_t[:,:,::1] t,
+                     np.float64_t[:,:,::1] dt,
+                     np.uint8_t[:,:,::1] child_mask):
+        cdef IntegrationAccumulator ia
+        ia.hits = 0
+        ia.t = <np.float64_t *> &t[0,0,0]
+        ia.dt = <np.float64_t *> &dt[0,0,0]
+        ia.child_mask = <np.uint8_t *> &child_mask[0,0,0]
+        walk_volume(vc, self.p1, self.vec, dt_sampler, <void*> &ia)
+        return ia.hits
+
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.cdivision(True)
@@ -1472,15 +1490,10 @@ cdef class RaySelector(SelectorObject):
         cdef np.ndarray[np.float64_t, ndim=1] tr, dtr
         cdef np.ndarray[np.uint8_t, ndim=3, cast=True] child_mask
         cdef int i, j, k, ni
-        cdef IntegrationAccumulator ia
         cdef VolumeContainer vc
         t = np.zeros(gobj.ActiveDimensions, dtype="float64")
         dt = np.zeros(gobj.ActiveDimensions, dtype="float64") - 1
         child_mask = gobj.child_mask
-        ia.t = <np.float64_t *> t.data
-        ia.dt = <np.float64_t *> dt.data
-        ia.child_mask = <np.uint8_t *> child_mask.data
-        ia.hits = 0
         _ensure_code(gobj.LeftEdge)
         _ensure_code(gobj.RightEdge)
         _ensure_code(gobj.dds)
@@ -1490,9 +1503,9 @@ cdef class RaySelector(SelectorObject):
             vc.dds[i] = gobj.dds[i]
             vc.idds[i] = 1.0/gobj.dds[i]
             vc.dims[i] = dt.shape[i]
-        walk_volume(&vc, self.p1, self.vec, dt_sampler, <void*> &ia)
-        tr = np.zeros(ia.hits, dtype="float64")
-        dtr = np.zeros(ia.hits, dtype="float64")
+        ni = self._get_dt(&vc, t, dt, child_mask.view("uint8"))
+        tr = np.zeros(ni, dtype="float64")
+        dtr = np.zeros(ni, dtype="float64")
         ni = 0
         for i in range(dt.shape[0]):
             for j in range(dt.shape[1]):
@@ -1501,8 +1514,8 @@ cdef class RaySelector(SelectorObject):
                         tr[ni] = t[i, j, k]
                         dtr[ni] = dt[i, j, k]
                         ni += 1
-        if not (ni == ia.hits):
-            print ni, ia.hits
+        if not (ni == dtr.size):
+            print ni, dtr.size
         return dtr, tr
 
     @cython.boundscheck(False)
@@ -1628,6 +1641,61 @@ cdef class DataCollectionSelector(SelectorObject):
     def __init__(self, dobj):
         self.obj_ids = dobj._obj_ids
         self.nids = self.obj_ids.shape[0]
+
+    cdef int select_bbox(self, np.float64_t left_edge[3],
+                               np.float64_t right_edge[3]) nogil:
+        # We have to return 1 here, although it does make me uncomfortable to
+        # do so.  This will always say we're hitting a certain bbox, but the
+        # only grids that will be selected are those that match the grid index.
+        return 1
+    
+    @cython.initializedcheck(False)
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    @cython.cdivision(True)
+    cdef void visit_grid_cells(self, GridVisitor visitor,
+                              GridTreeNode *grid, int use_cache,
+                              np.uint8_t[:] cached_mask):
+        # We override so that we can correctly pick out the grids we want to
+        # visit.
+        cdef np.float64_t left_edge[3]
+        cdef np.float64_t right_edge[3]
+        cdef np.float64_t dds[3]
+        cdef int dim[3]
+        cdef int level, i, selected = 0
+        cdef np.float64_t pos[3]
+        cdef np.int64_t[:] oids = self.obj_ids
+        # This should be done faster somehow, but it's not awful for now.
+        for i in range(oids.shape[0]):
+            if oids[i] == grid.index:
+                selected = 1
+                break
+        if selected == 0: return
+        level = grid.level
+        for i in range(3):
+            left_edge[i] = grid.left_edge[i]
+            right_edge[i] = grid.right_edge[i]
+            dds[i] = (right_edge[i] - left_edge[i])/grid.dims[i]
+            dim[i] = grid.dims[i]
+        with nogil:
+            pos[0] = left_edge[0] + dds[0] * 0.5
+            visitor.pos[0] = 0
+            for i in range(dim[0]):
+                pos[1] = left_edge[1] + dds[1] * 0.5
+                visitor.pos[1] = 0
+                for j in range(dim[1]):
+                    pos[2] = left_edge[2] + dds[2] * 0.5
+                    visitor.pos[2] = 0
+                    for k in range(dim[2]):
+                        # Selected is always 1 for this type
+                        visitor.visit(grid, 1)
+                        visitor.global_index += 1
+                        pos[2] += dds[2]
+                        visitor.pos[2] += 1
+                    pos[1] += dds[1]
+                    visitor.pos[1] += 1
+                pos[0] += dds[0]
+                visitor.pos[0] += 1
 
     @cython.boundscheck(False)
     @cython.wraparound(False)
